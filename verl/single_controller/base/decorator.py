@@ -161,23 +161,20 @@ def dispatch_megatron_compute(worker_group, *args, **kwargs):
     args = [[ray.put(dp_arg) for dp_arg in arg] for arg in args]
     kwargs = {k: [ray.put(dp_v) for dp_v in v] for k, v in kwargs.items()}
 
+    # pre-compute mapping from global rank to the corresponding dp rank
+    dp_rank_map = [worker_group.get_megatron_rank_info(rank=i).dp_rank for i in range(worker_group.world_size)]
+
     all_args = []
     for arg in args:
         assert isinstance(arg, (Tuple, List)) and len(arg) == worker_group.dp_size
-        transformed_args = []
-        for i in range(worker_group.world_size):
-            local_dp_rank = worker_group.get_megatron_rank_info(rank=i).dp_rank
-            transformed_args.append(arg[local_dp_rank])
+        transformed_args = [arg[dp_rank] for dp_rank in dp_rank_map]
         all_args.append(transformed_args)
     all_args = tuple(all_args)
 
     all_kwargs = {}
     for k, v in kwargs.items():
         assert isinstance(v, (Tuple, List)) and len(v) == worker_group.dp_size
-        transformed_v = []
-        for i in range(worker_group.world_size):
-            local_dp_rank = worker_group.get_megatron_rank_info(rank=i).dp_rank
-            transformed_v.append(v[local_dp_rank])
+        transformed_v = [v[dp_rank] for dp_rank in dp_rank_map]
         all_kwargs[k] = transformed_v
     return all_args, all_kwargs
 
