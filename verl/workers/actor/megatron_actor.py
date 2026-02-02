@@ -357,6 +357,9 @@ class MegatronPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        # Include partition_weights for weighted PMD when using opmd loss
+        if self.config.policy_loss.get("loss_mode", "vanilla") in ["opmd"] and "partition_weights" in data.batch.keys():
+            select_keys.append("partition_weights")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         # router replay
         if self.enable_routing_replay:
@@ -492,16 +495,48 @@ class MegatronPPOActor(BasePPOActor):
                 # Extract pre-computed rollout correction weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                 rollout_is_weights = data.get("rollout_is_weights", None)
-                pg_loss, pg_metrics = policy_loss_fn(
-                    old_log_prob=old_log_prob,
-                    log_prob=log_prob,
-                    advantages=advantages,
-                    response_mask=response_mask,
-                    loss_agg_mode=loss_agg_mode,
-                    config=self.config,
-                    rollout_is_weights=rollout_is_weights,
-                )
+
+                # Compute policy loss (any function is expected to return 2 values)
+                # Only pass extra_loss_kwargs for loss modes that accept it (e.g., opmd)
+                if loss_mode in ["opmd"]:
+                    extra_loss_kwargs = {}
+                    if "partition_weights" in data:
+                        extra_loss_kwargs["partition_weights"] = data["partition_weights"]
+                    pg_loss, pg_metrics = policy_loss_fn(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_is_weights=rollout_is_weights,
+                        extra_loss_kwargs=extra_loss_kwargs if extra_loss_kwargs else None,
+                    )
+                else:
+                    pg_loss, pg_metrics = policy_loss_fn(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_is_weights=rollout_is_weights,
+                    )
                 stats.update(pg_metrics)
+
+                is_last_batch = meta_info.get("is_last_batch", False)
+                if is_last_batch:
+                    # compute sequence-level ratios
+                    log_prob_sum = (log_prob * response_mask).sum(dim=1)
+                    old_log_prob_sum = (old_log_prob * response_mask).sum(dim=1)
+                    log_ratios = log_prob_sum - old_log_prob_sum
+                    ratios = torch.exp(log_ratios)
+
+                    metrics["train/pmd_ratio_mean"] = ratios.mean().detach().item()
+                    metrics["train/pmd_ratio_min"] = ratios.min().detach().item()
+                    metrics["train/pmd_ratio_max"] = ratios.max().detach().item()
+
+                policy_loss = pg_loss
 
                 # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                 rollout_log_prob = data.get("rollout_log_probs", None)
@@ -746,7 +781,14 @@ class MegatronPPOActor(BasePPOActor):
         metrics = {}
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
-        for data in dataloader:
+
+        current_data = next(dataloader, None)
+        while current_data is not None:
+            next_data = next(dataloader, None)
+            is_last_batch = (next_data is None)
+
+            data = current_data
+
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             self.actor_optimizer.zero_grad()
@@ -763,6 +805,8 @@ class MegatronPPOActor(BasePPOActor):
             max_token_len = None
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
+
+            data.meta_info["is_last_batch"] = is_last_batch
             metric_micro_batch = self.forward_backward_batch(
                 data,
                 calculate_entropy=calculate_entropy,

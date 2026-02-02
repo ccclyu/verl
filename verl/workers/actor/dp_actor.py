@@ -419,6 +419,9 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        # Include partition_weights for weighted PMD when using opmd loss
+        if self.config.policy_loss.get("loss_mode", "vanilla") in ["opmd"] and "partition_weights" in data.batch.keys():
+            select_keys.append("partition_weights")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -492,15 +495,31 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                    # Only pass extra_loss_kwargs for loss modes that accept it (e.g., opmd)
+                    if loss_mode in ["opmd"]:
+                        extra_loss_kwargs = {}
+                        if "partition_weights" in model_inputs:
+                            extra_loss_kwargs["partition_weights"] = model_inputs["partition_weights"]
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            extra_loss_kwargs=extra_loss_kwargs if extra_loss_kwargs else None,
+                        )
+                    else:
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
@@ -516,6 +535,17 @@ class DataParallelPPOActor(BasePPOActor):
                             response_mask=response_mask,
                         )
                         micro_batch_metrics.update(rollout_corr_metrics)
+
+                    # TODO: (ycl) log the sequence-level \phi_{\theta}/\phi_{old}
+                    if batch_idx == len(mini_batches) -1:
+                        log_prob_sum = (log_prob * response_mask).sum(dim=1)  # (bs,)
+                        old_log_prob_sum = (old_log_prob * response_mask).sum(dim=1)  # (bs,)
+                        log_ratios = log_prob_sum - old_log_prob_sum  # (bs,)
+                        ratios = torch.exp(log_ratios)
+
+                        micro_batch_metrics["train/pmd_ratio_mean"] = ratios.mean().detach().item()
+                        micro_batch_metrics["train/pmd_ratio_min"] = ratios.min().detach().item()
+                        micro_batch_metrics["train/pmdratio_max"] = ratios.max().detach().item()
 
                     policy_loss = pg_loss
                     if calculate_entropy and entropy is not None:

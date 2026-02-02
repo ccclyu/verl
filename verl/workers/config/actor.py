@@ -78,6 +78,8 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    pmd_tau: float = 0.01
+    pmd_alpha: float = 1.0
 
 
 @dataclass
@@ -162,6 +164,7 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    reset_optimizer_states_freq: int = 0  # Reset optimizer states every N global steps (0 = never reset)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
