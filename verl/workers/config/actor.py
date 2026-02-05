@@ -79,8 +79,6 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     pmd_tau: float = 0.01
-    pmd_alpha: float = 1.0
-
 
 @dataclass
 class ActorConfig(BaseConfig):
