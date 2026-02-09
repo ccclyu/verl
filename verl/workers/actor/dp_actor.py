@@ -536,8 +536,8 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         micro_batch_metrics.update(rollout_corr_metrics)
 
-                    # TODO: (ycl) log the sequence-level \phi_{\theta}/\phi_{old}
-                    if batch_idx == len(mini_batches) -1:
+                    # log the sequence-level \phi_{\theta}/\phi_{old} in the ompd loss
+                    if self.config.policy_loss.get("loss_mode", "vanilla") in ["opmd"] and batch_idx == len(mini_batches) -1:
                         log_prob_sum = (log_prob * response_mask).sum(dim=1)  # (bs,)
                         old_log_prob_sum = (old_log_prob * response_mask).sum(dim=1)  # (bs,)
                         log_ratios = log_prob_sum - old_log_prob_sum  # (bs,)

@@ -525,7 +525,7 @@ class MegatronPPOActor(BasePPOActor):
                 stats.update(pg_metrics)
 
                 is_last_batch = meta_info.get("is_last_batch", False)
-                if is_last_batch:
+                if self.config.policy_loss.get("loss_mode", "vanilla") in ["opmd"] and is_last_batch:
                     # compute sequence-level ratios
                     log_prob_sum = (log_prob * response_mask).sum(dim=1)
                     old_log_prob_sum = (old_log_prob * response_mask).sum(dim=1)
